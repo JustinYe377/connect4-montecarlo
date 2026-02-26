@@ -7,6 +7,15 @@ import os
 
 import numpy as np
 
+# LLM integration (optional — only used when llm_evaluator is set on MCTS)
+try:
+    from llm_provider import LLMConfig, get_provider
+    from llm_mcts import LLMEvaluator
+    from reporter import GameReporter
+    LLM_AVAILABLE = True
+except ImportError:
+    LLM_AVAILABLE = False
+
 # MCTS move computation time
 PROCESS_TIME: float = 3.0
 
@@ -193,6 +202,52 @@ class MCTS:
     def __init__(self, symbol: int, t: float) -> None:
         self.symbol = symbol
         self.t = t
+        # LLM evaluation (set via setup_llm() — None means pure random rollout)
+        self.llm_evaluator: Optional["LLMEvaluator"] = None
+        self._reporter: Optional["GameReporter"] = None
+
+    def setup_llm(
+        self,
+        backend: str = "ollama",
+        model: str = "deepseek-r1:7b",
+        mode: str = "hybrid",
+        hybrid_k: int = 2,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        reporter: Optional["GameReporter"] = None,
+    ) -> None:
+        """Configure LLM-based rollout evaluation.
+
+        Call this after creating MCTS to enable LLM evaluation.
+        Without calling this, the original random rollout is used.
+
+        Args:
+            backend:  "ollama" | "deepseek" | "anthropic"
+            model:    model name (e.g. "deepseek-r1:7b", "deepseek-chat",
+                      "claude-haiku-4-5-20251001")
+            mode:     "direct" | "prior" | "guided" | "hybrid"
+            hybrid_k: LLM-guided plies before switching to random (hybrid only)
+            api_key:  API key (or set DEEPSEEK_API_KEY / ANTHROPIC_API_KEY env vars)
+            base_url: Override LLM endpoint URL (custom Ollama host, etc.)
+            reporter: GameReporter instance for stat tracking
+        """
+        if not LLM_AVAILABLE:
+            print("[MCTS] Warning: llm_provider.py not found — falling back to random rollout.")
+            return
+        cfg = LLMConfig(
+            backend=backend,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+        )
+        provider = get_provider(cfg)
+        self.llm_evaluator = LLMEvaluator(
+            provider=provider,
+            mode=mode,
+            hybrid_k=hybrid_k,
+        )
+        self._reporter = reporter
+        print(f"[MCTS] LLM evaluation enabled: backend={backend} model={model} mode={mode}")
 
     def compute_move(self, node: "Node") -> Tuple[int, int]:
         """Compute move using MCTS algorithm.
@@ -304,14 +359,34 @@ class MCTS:
         return None
 
     def rollout(self, node: "Node") -> Optional[int]:
-        """Perform a random game simulation.
+        """Perform game simulation (random or LLM-guided).
+
+        If setup_llm() was called, uses LLM evaluation instead of random play.
+        Otherwise falls back to the original random rollout unchanged.
 
         Args:
             node (Node): Starting node.
 
         Returns:
-            int | None: Game result.
+            int | None: Game result (winner symbol, or None for tie).
         """
+        # ── LLM path ──────────────────────────────────────────────────────────
+        if self.llm_evaluator is not None:
+            # Convert numpy board to list-of-lists for the LLM system
+            board_list = node.board.tolist()
+            # node.turn is the player whose turn it is at this node
+            result_01 = self.llm_evaluator.rollout(
+                board_list, int(node.turn), _NumpyGameAdapter()
+            )
+            # LLM returns 0.0–1.0 win probability for node.turn.
+            # Map back to original result convention: winner symbol or None.
+            if result_01 >= 0.6:
+                return node.turn           # LLM thinks current player wins
+            elif result_01 <= 0.4:
+                return 1 if node.turn == 2 else 2   # opponent wins
+            else:
+                return None                # too close to call → treat as tie
+        # ── Original random rollout (unchanged) ───────────────────────────────
         board = node.board
         turn = node.turn
         if not node.terminal:
@@ -510,6 +585,36 @@ class Node:
             if (new_child == child).all():
                 return True
         return False
+
+
+class _NumpyGameAdapter:
+    """
+    Adapter so LLMEvaluator (which expects list-of-lists) can work with
+    the numpy-based game logic already in this file.
+    Used only internally by MCTS.rollout().
+    """
+
+    def get_legal_moves(self, board: list) -> list:
+        return [c for c in range(7) if board[0][c] == 0]
+
+    def make_move(self, board: list, col: int, player: int) -> list:
+        new_board = [row[:] for row in board]
+        for row in range(5, -1, -1):
+            if new_board[row][col] == 0:
+                new_board[row][col] = player
+                return new_board
+        return new_board
+
+    def check_win(self, board: list, player: int) -> bool:
+        np_board = np.array(board)
+        return (
+            GameBoard.check_rows(np_board) == player
+            or GameBoard.check_cols(np_board) == player
+            or GameBoard.check_diag(np_board) == player
+        )
+
+    def is_draw(self, board: list) -> bool:
+        return all(board[0][c] != 0 for c in range(7))
 
 
 if __name__ == "__main__":

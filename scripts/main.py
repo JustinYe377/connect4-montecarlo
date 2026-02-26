@@ -20,6 +20,36 @@ PROCESS_TIME = 5
 # Frame rate
 FPS = 30
 
+# ── LLM Configuration ─────────────────────────────────────────────────────────
+# Set USE_LLM = True to enable LLM-based rollout evaluation.
+# Set USE_LLM = False for original pure-random MCTS (no API calls).
+USE_LLM = True
+
+# Backend: "ollama" (local, free) | "deepseek" (cloud) | "anthropic" (cloud)
+LLM_BACKEND = "ollama"
+
+# Model name — examples:
+#   ollama:     "deepseek-r1:7b", "llama3.2:3b", "mistral"
+#   deepseek:   "deepseek-chat", "deepseek-reasoner"
+#   anthropic:  "claude-haiku-4-5-20251001"
+LLM_MODEL = "deepseek-r1:7b"
+
+# Evaluation mode: "direct" | "prior" | "guided" | "hybrid"
+LLM_MODE = "hybrid"
+
+# For hybrid mode: how many LLM-guided plies before switching to random play
+LLM_HYBRID_K = 2
+
+# API key — leave None to read from env var (DEEPSEEK_API_KEY / ANTHROPIC_API_KEY)
+LLM_API_KEY = None
+
+# Custom Ollama URL — None uses default http://localhost:11434
+LLM_BASE_URL = None
+
+# Set True to generate a reports/ folder with stats after each game
+ENABLE_REPORTING = True
+# ──────────────────────────────────────────────────────────────────────────────
+
 
 if __name__ == "__main__":
 
@@ -33,14 +63,55 @@ if __name__ == "__main__":
     move_queue: "Queue[int]" = Queue()
     graphics = GameGraphics(win_size=WIN_SIZE, surface=window)
 
+    # ── Reporter setup (optional) ──────────────────────────────────────────────
+    reporter = None
+    if ENABLE_REPORTING:
+        try:
+            from reporter import GameReporter
+            reporter = GameReporter(
+                config={
+                    "backend": LLM_BACKEND if USE_LLM else "random",
+                    "model":   LLM_MODEL   if USE_LLM else "random",
+                    "mode":    LLM_MODE    if USE_LLM else "random",
+                    "process_time_s": PROCESS_TIME,
+                },
+                output_dir="reports",
+            )
+            reporter.register_agent("MCTS-LLM" if USE_LLM else "MCTS-Random",
+                                    1, LLM_MODE if USE_LLM else "random",
+                                    LLM_BACKEND if USE_LLM else "none",
+                                    LLM_MODEL   if USE_LLM else "none")
+            reporter.register_agent("Human", 2, "human", "none", "none")
+        except ImportError:
+            print("[main] reporter.py not found — reporting disabled.")
+    # ──────────────────────────────────────────────────────────────────────────
+
     # Begin new game
     while True:
 
         gameboard = GameBoard(cpu=1)
         montecarlo = MCTS(symbol=1, t=PROCESS_TIME)
+
+        # ── Enable LLM evaluation ──────────────────────────────────────────────
+        if USE_LLM:
+            montecarlo.setup_llm(
+                backend=LLM_BACKEND,
+                model=LLM_MODEL,
+                mode=LLM_MODE,
+                hybrid_k=LLM_HYBRID_K,
+                api_key=LLM_API_KEY,
+                base_url=LLM_BASE_URL,
+                reporter=reporter,
+            )
+        # ──────────────────────────────────────────────────────────────────────
+
+        if reporter:
+            reporter.start_game()
+
         game_over = False
         winner_id = None
         select_move = 1
+        move_number = 0
         threads: List[Thread] = []
 
         # Game loop
@@ -49,6 +120,9 @@ if __name__ == "__main__":
             # Check for game over
             game_over, winner_id = gameboard.check_win()
             if game_over is True:
+                if reporter:
+                    reporter.finish_game(winner=winner_id, total_moves=move_number)
+                    reporter.save()
                 pygame.time.wait(1000)
                 break
 
@@ -68,6 +142,21 @@ if __name__ == "__main__":
                                 select_move -= 1
                         elif event.key == pygame.K_RETURN:
                             if gameboard.board[5, select_move - 1] == 0:
+                                # Record human move
+                                if reporter:
+                                    from reporter import GameReporter
+                                    from llm_mcts import MoveRecord
+                                    move_number += 1
+                                    legal = [c+1 for c in range(7) if gameboard.board[5, c] == 0]
+                                    reporter.record_move(MoveRecord(
+                                        move_number=move_number,
+                                        player=gameboard.turn,
+                                        column=select_move,
+                                        legal_moves=legal,
+                                        llm_win_prob=None,
+                                        eval_mode="human",
+                                        latency_s=0.0,
+                                    ))
                                 gameboard.apply_move(select_move)
 
             # Monte Carlo turn
@@ -91,6 +180,29 @@ if __name__ == "__main__":
                 if move_queue.empty() is False:
                     threads.pop()
                     move = move_queue.get()
+                    # Record MCTS move
+                    if reporter:
+                        from llm_mcts import MoveRecord
+                        move_number += 1
+                        legal = [c+1 for c in range(7) if gameboard.board[5, c] == 0]
+                        # Evaluate position for reporting
+                        win_prob = None
+                        if montecarlo.llm_evaluator is not None:
+                            try:
+                                win_prob = montecarlo.llm_evaluator.provider.evaluate_position(
+                                    gameboard.board.tolist(), montecarlo.symbol
+                                )
+                            except Exception:
+                                pass
+                        reporter.record_move(MoveRecord(
+                            move_number=move_number,
+                            player=montecarlo.symbol,
+                            column=move[1] + 1,  # convert 0-indexed col to 1-indexed
+                            legal_moves=legal,
+                            llm_win_prob=win_prob,
+                            eval_mode=LLM_MODE if USE_LLM else "random",
+                            latency_s=0.0,
+                        ))
                     gameboard.board[move] = montecarlo.symbol
                     gameboard.switch_turn()
 
