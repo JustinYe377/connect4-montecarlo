@@ -51,8 +51,8 @@ class LLMConfig:
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     temperature: float = 0.0
-    max_tokens: int = 16
-    timeout: int = 30
+    max_tokens: int = 512      # enough for <think> block + final answer
+    timeout: int = 60          # thinking models can be slow, bumped from 30
     cache: bool = True
 
     # runtime stats (populated automatically)
@@ -87,9 +87,19 @@ def board_to_text(board: list[list[int]]) -> str:
     return "\n".join(lines)
 
 
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks that reasoning models emit before their answer."""
+    import re as _re
+    # Remove everything between <think> and </think> (including the tags)
+    text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL)
+    # Also strip common variants
+    text = _re.sub(r"<thinking>.*?</thinking>", "", text, flags=_re.DOTALL)
+    return text.strip()
+
+
 def _parse_float(text: str) -> float:
-    """Extract the first float from a string, clamp to [0,1]."""
-    # strip markdown / whitespace
+    """Extract the final answer float from LLM response, ignoring thinking blocks."""
+    text = _strip_thinking(text)
     text = text.strip().strip("`").strip()
     match = re.search(r"0?\.\d+|\d+\.\d*|\d+", text)
     if match:
@@ -285,7 +295,8 @@ class OllamaProvider:
         legal = [c for c in range(len(board[0])) if board[0][c] == 0]
         if not legal:
             return None
-        text = self._call(_build_move_prompt(board, current_player)).strip()
+        raw = self._call(_build_move_prompt(board, current_player))
+        text = _strip_thinking(raw).strip()
         try:
             col = int(re.search(r"\d+", text).group())
             if col in legal:
