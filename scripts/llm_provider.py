@@ -62,30 +62,52 @@ def _strip_thinking(text: str) -> str:
 def _parse_float(text: str, debug: bool = False) -> float:
     """
     Extract win probability from LLM response.
-    Strips thinking blocks first, then looks for a float in [0, 1].
+    Handles clean responses ("0.65"), markdown bold ("**0.65**"),
+    and prose ("Win probability: 0.65") by trying patterns in order.
     """
-    original = text
-    text = _strip_thinking(text).strip().strip("`").strip()
+    text = _strip_thinking(text).strip()
 
     if debug:
-        print(f"  [parse] after strip: {repr(text[:120])}")
+        print(f"  [parse] input: {repr(text[:150])}")
 
-    # Look for explicit decimal like 0.65 or .7 first (most reliable)
-    match = re.search(r"\b(0\.\d+|1\.0+|0|1)\b", text)
+    # Strip markdown bold/italic markers so **0.65** becomes 0.65
+    cleaned = re.sub(r"[*_`#]", "", text).strip()
+
+    # 1. Explicit decimal in [0,1] — most reliable e.g. "0.65" or ".7"
+    match = re.search(r"\b(0\.\d+|1\.0*)\b", cleaned)
     if match:
         val = float(match.group())
-        return max(0.0, min(1.0, val))
+        if debug:
+            print(f"  [parse] decimal match: {val}")
+        return round(max(0.0, min(1.0, val)), 4)
 
-    # Fallback: any number
-    match = re.search(r"\d+\.?\d*", text)
+    # 2. Standalone "0" or "1"
+    match = re.search(r"\b([01])\b", cleaned)
     if match:
         val = float(match.group())
-        if val > 1.0:
-            val = val / 100.0  # handle "65" meaning 0.65
-        return max(0.0, min(1.0, val))
+        if debug:
+            print(f"  [parse] integer match: {val}")
+        return val
+
+    # 3. Percentage like "65%" → 0.65
+    match = re.search(r"(\d{1,3})\s*%", cleaned)
+    if match:
+        val = float(match.group(1)) / 100.0
+        if debug:
+            print(f"  [parse] percent match: {val}")
+        return round(max(0.0, min(1.0, val)), 4)
+
+    # 4. Large integer that probably means a percentage e.g. "65" → 0.65
+    match = re.search(r"\b(\d{2,3})\b", cleaned)
+    if match:
+        val = float(match.group(1)) / 100.0
+        if 0.0 <= val <= 1.0:
+            if debug:
+                print(f"  [parse] large int as percent: {val}")
+            return round(val, 4)
 
     if debug:
-        print(f"  [parse] FAILED — no number found in: {repr(text[:200])}")
+        print(f"  [parse] FAILED — returning 0.5 fallback")
     return 0.5
 
 
@@ -116,6 +138,20 @@ def _build_move_prompt(board: list[list[int]], current_player: int, origin: str 
     )
 
 
+# System message that forces single-token structured output
+_EVAL_SYSTEM = (
+    "You are a Connect Four evaluation function. "
+    "You MUST respond with ONLY a single decimal number between 0.0 and 1.0. "
+    "No explanation, no markdown, no words. Just the number, e.g.: 0.6"
+)
+
+_MOVE_SYSTEM = (
+    "You are a Connect Four move selector. "
+    "You MUST respond with ONLY a single integer column number. "
+    "No explanation, no markdown, no words. Just the digit, e.g.: 3"
+)
+
+
 def _http_post(url: str, headers: dict, body: dict, timeout: int) -> dict:
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -132,48 +168,48 @@ class OllamaProvider:
         self.cfg = cfg
         self.base_url = (cfg.base_url or "http://localhost:11434").rstrip("/")
 
-    def _call(self, prompt: str) -> str:
-        """
-        Use /api/chat with think=false for Qwen3-style models.
-        Falls back to /api/generate if chat endpoint fails.
-        """
-        # Try chat endpoint first (better for instruction-tuned models)
+    def _call(self, prompt: str, system: str = "") -> str:
         url = f"{self.base_url}/api/chat"
         headers = {"Content-Type": "application/json"}
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
         body = {
             "model": self.cfg.model,
             "stream": False,
-            "think": self.cfg.think,   # False = disable chain-of-thought output
+            "think": self.cfg.think,
             "options": {
                 "temperature": self.cfg.temperature,
                 "num_predict": self.cfg.max_tokens,
             },
-            "messages": [{"role": "user", "content": prompt}]
+            "messages": messages,
         }
         try:
             resp = _http_post(url, headers, body, self.cfg.timeout)
-            # /api/chat response format
             content = resp.get("message", {}).get("content", "")
             if content:
                 return content
         except Exception as e:
             if self.cfg.debug:
-                print(f"  [ollama] chat endpoint failed ({e}), trying generate...")
+                print(f"  [ollama] chat failed ({e}), trying generate...")
 
         # Fallback to /api/generate
-        url = f"{self.base_url}/api/generate"
+        url2 = f"{self.base_url}/api/generate"
+        full_prompt = f"{system}\n\n{prompt}" if system else prompt
         body2 = {
             "model": self.cfg.model,
-            "prompt": prompt,
+            "prompt": full_prompt,
             "stream": False,
             "options": {"temperature": self.cfg.temperature,
                         "num_predict": self.cfg.max_tokens},
         }
-        resp = _http_post(url, headers, body2, self.cfg.timeout)
-        return resp.get("response", "")
+        resp2 = _http_post(url2, headers, body2, self.cfg.timeout)
+        return resp2.get("response", "")
 
     def evaluate_position(self, board, current_player: int) -> float:
-        raw = self._call(_build_prompt(board, current_player, origin="top"))
+        raw = self._call(_build_prompt(board, current_player, origin="top"),
+                         system=_EVAL_SYSTEM)
         if self.cfg.debug:
             print(f"  [LLM raw] {repr(raw[:200])}")
         return _parse_float(raw, debug=self.cfg.debug)
@@ -182,7 +218,8 @@ class OllamaProvider:
         legal = _get_legal_cols(board, origin="top")
         if not legal:
             return None
-        raw = self._call(_build_move_prompt(board, current_player, origin="top"))
+        raw = self._call(_build_move_prompt(board, current_player, origin="top"),
+                         system=_MOVE_SYSTEM)
         if self.cfg.debug:
             print(f"  [LLM raw move] {repr(raw[:200])}")
         text = _strip_thinking(raw).strip()
