@@ -1,22 +1,14 @@
 """
 llm_provider.py
 ---------------
-Unified LLM provider interface supporting:
-  - Anthropic Claude (cloud)
-  - DeepSeek (cloud, OpenAI-compatible)
-  - Ollama (local, any model)
+Unified LLM provider: Anthropic, DeepSeek, Ollama.
 """
 
 from __future__ import annotations
-
-import json
-import os
-import re
-import time
+import json, os, re, time
 from dataclasses import dataclass, field
 from typing import Optional
-import urllib.request
-import urllib.error
+import urllib.request, urllib.error
 
 
 @dataclass
@@ -26,10 +18,11 @@ class LLMConfig:
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     temperature: float = 0.0
-    max_tokens: int = 512      # high enough for thinking model <think> blocks
-    timeout: int = 60          # thinking models can be slow
+    max_tokens: int = 1024     # generous budget for thinking models
+    timeout: int = 90
     cache: bool = True
-    debug: bool = False        # set True to print raw LLM responses
+    debug: bool = False
+    think: bool = False        # set True to enable chain-of-thought (slower)
 
     _call_count: int = field(default=0, init=False, repr=False)
     _total_latency: float = field(default=0.0, init=False, repr=False)
@@ -41,17 +34,13 @@ PLAYER_SYMBOLS = {1: "X", 2: "O"}
 
 def board_to_text(board: list[list[int]], origin: str = "top") -> str:
     """
-    Convert board to readable text. Output always shows bottom row at the bottom.
-
-    origin="top"    -> board[0] is the TOP   (game_adapter list-of-lists format)
-    origin="bottom" -> board[0] is the BOTTOM (original numpy GameBoard format)
+    Render board with bottom row at the bottom (as gravity dictates).
+    origin='top'    -> board[0] is the top    (game_adapter / list-of-lists)
+    origin='bottom' -> board[0] is the bottom (original numpy GameBoard)
     """
     sym = {0: ".", 1: "X", 2: "O"}
-    if origin == "bottom":
-        display_rows = list(reversed(board))
-    else:
-        display_rows = list(board)
-    lines = [" ".join(sym[int(c)] for c in row) for row in display_rows]
+    rows = list(reversed(board)) if origin == "bottom" else list(board)
+    lines = [" ".join(sym[int(c)] for c in row) for row in rows]
     lines.append(" ".join(str(i) for i in range(len(board[0]))))
     return "\n".join(lines)
 
@@ -61,61 +50,69 @@ def _get_legal_cols(board: list[list[int]], origin: str = "top") -> list[int]:
     rows = len(board)
     if origin == "bottom":
         return [c for c in range(cols) if board[rows - 1][c] == 0]
-    else:
-        return [c for c in range(cols) if board[0][c] == 0]
+    return [c for c in range(cols) if board[0][c] == 0]
 
 
 def _strip_thinking(text: str) -> str:
-    """Remove <think>...</think> blocks emitted by reasoning models."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
     return text.strip()
 
 
-def _parse_float(text: str) -> float:
-    """Extract final answer float, ignoring thinking blocks."""
+def _parse_float(text: str, debug: bool = False) -> float:
+    """
+    Extract win probability from LLM response.
+    Strips thinking blocks first, then looks for a float in [0, 1].
+    """
+    original = text
     text = _strip_thinking(text).strip().strip("`").strip()
-    match = re.search(r"0?\.\d+|\d+\.\d*|\d+", text)
+
+    if debug:
+        print(f"  [parse] after strip: {repr(text[:120])}")
+
+    # Look for explicit decimal like 0.65 or .7 first (most reliable)
+    match = re.search(r"\b(0\.\d+|1\.0+|0|1)\b", text)
     if match:
         val = float(match.group())
         return max(0.0, min(1.0, val))
+
+    # Fallback: any number
+    match = re.search(r"\d+\.?\d*", text)
+    if match:
+        val = float(match.group())
+        if val > 1.0:
+            val = val / 100.0  # handle "65" meaning 0.65
+        return max(0.0, min(1.0, val))
+
+    if debug:
+        print(f"  [parse] FAILED — no number found in: {repr(text[:200])}")
     return 0.5
 
 
 def _build_prompt(board: list[list[int]], current_player: int, origin: str = "top") -> str:
     sym = PLAYER_SYMBOLS[current_player]
     board_str = board_to_text(board, origin=origin)
-    legal_cols = _get_legal_cols(board, origin=origin)
-    legal_str = ", ".join(str(c) for c in legal_cols)
+    legal_str = ", ".join(str(c) for c in _get_legal_cols(board, origin=origin))
     return (
-        f"You are a Connect Four expert evaluator.\n\n"
-        f"Current board (bottom row = gravity, pieces fall downward):\n"
+        f"Connect Four position. Bottom row = gravity (pieces fall down).\n\n"
         f"{board_str}\n\n"
-        f"Player {sym} is about to move. Legal columns: {legal_str}\n\n"
-        f"Analyze the position carefully:\n"
-        f"- Does either player have 3-in-a-row with an open end? (immediate threat)\n"
-        f"- Who controls the center columns (2, 3, 4)?\n"
-        f"- Who has more connected pieces?\n\n"
-        f"Estimate the win probability for player {sym}.\n"
-        f"Output ONLY a single decimal number between 0.0 and 1.0.\n"
-        f"Examples: 0.3 (losing), 0.5 (even), 0.7 (winning), 0.9 (near certain win)\n"
-        f"Your answer (just the number):"
+        f"Player {sym} to move. Legal columns: {legal_str}\n"
+        f"Win probability for {sym} (0.0=losing, 0.5=even, 1.0=winning)?\n"
+        f"Reply with one decimal number only, e.g. 0.6\n"
+        f"Answer:"
     )
 
 
 def _build_move_prompt(board: list[list[int]], current_player: int, origin: str = "top") -> str:
     sym = PLAYER_SYMBOLS[current_player]
     board_str = board_to_text(board, origin=origin)
-    legal_cols = _get_legal_cols(board, origin=origin)
-    legal_str = ", ".join(str(c) for c in legal_cols)
+    legal_str = ", ".join(str(c) for c in _get_legal_cols(board, origin=origin))
     return (
-        f"You are a Connect Four expert.\n\n"
-        f"Current board (bottom row = gravity):\n"
+        f"Connect Four. Bottom row = gravity.\n\n"
         f"{board_str}\n\n"
-        f"Player {sym} must play. Legal columns: {legal_str}\n\n"
-        f"Choose the best column. Consider winning moves first, then blocking.\n"
-        f"Output ONLY a single integer column number from: {legal_str}\n"
-        f"Your answer (just the number):"
+        f"Player {sym} to move. Legal columns: {legal_str}\n"
+        f"Best column for {sym}? Reply with one integer only.\n"
+        f"Answer:"
     )
 
 
@@ -125,6 +122,80 @@ def _http_post(url: str, headers: dict, body: dict, timeout: int) -> dict:
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
+
+# ---------------------------------------------------------------------------
+# Ollama provider — uses /api/chat endpoint which handles Qwen3 better
+# ---------------------------------------------------------------------------
+
+class OllamaProvider:
+    def __init__(self, cfg: LLMConfig):
+        self.cfg = cfg
+        self.base_url = (cfg.base_url or "http://localhost:11434").rstrip("/")
+
+    def _call(self, prompt: str) -> str:
+        """
+        Use /api/chat with think=false for Qwen3-style models.
+        Falls back to /api/generate if chat endpoint fails.
+        """
+        # Try chat endpoint first (better for instruction-tuned models)
+        url = f"{self.base_url}/api/chat"
+        headers = {"Content-Type": "application/json"}
+        body = {
+            "model": self.cfg.model,
+            "stream": False,
+            "think": self.cfg.think,   # False = disable chain-of-thought output
+            "options": {
+                "temperature": self.cfg.temperature,
+                "num_predict": self.cfg.max_tokens,
+            },
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        try:
+            resp = _http_post(url, headers, body, self.cfg.timeout)
+            # /api/chat response format
+            content = resp.get("message", {}).get("content", "")
+            if content:
+                return content
+        except Exception as e:
+            if self.cfg.debug:
+                print(f"  [ollama] chat endpoint failed ({e}), trying generate...")
+
+        # Fallback to /api/generate
+        url = f"{self.base_url}/api/generate"
+        body2 = {
+            "model": self.cfg.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": self.cfg.temperature,
+                        "num_predict": self.cfg.max_tokens},
+        }
+        resp = _http_post(url, headers, body2, self.cfg.timeout)
+        return resp.get("response", "")
+
+    def evaluate_position(self, board, current_player: int) -> float:
+        raw = self._call(_build_prompt(board, current_player, origin="top"))
+        if self.cfg.debug:
+            print(f"  [LLM raw] {repr(raw[:200])}")
+        return _parse_float(raw, debug=self.cfg.debug)
+
+    def suggest_move(self, board, current_player: int) -> int | None:
+        legal = _get_legal_cols(board, origin="top")
+        if not legal:
+            return None
+        raw = self._call(_build_move_prompt(board, current_player, origin="top"))
+        if self.cfg.debug:
+            print(f"  [LLM raw move] {repr(raw[:200])}")
+        text = _strip_thinking(raw).strip()
+        try:
+            col = int(re.search(r"\d+", text).group())
+            return col if col in legal else None
+        except Exception:
+            return None
+
+
+# ---------------------------------------------------------------------------
+# Cloud providers
+# ---------------------------------------------------------------------------
 
 class AnthropicProvider:
     BASE_URL = "https://api.anthropic.com/v1/messages"
@@ -146,10 +217,9 @@ class AnthropicProvider:
 
     def evaluate_position(self, board, current_player: int) -> float:
         raw = self._call(_build_prompt(board, current_player, origin="top"))
-        val = _parse_float(raw)
         if self.cfg.debug:
-            print(f"  [LLM eval] answer={repr(_strip_thinking(raw).strip()[:60])}  parsed={val:.2f}")
-        return val
+            print(f"  [LLM raw] {repr(raw[:200])}")
+        return _parse_float(raw, debug=self.cfg.debug)
 
     def suggest_move(self, board, current_player: int) -> int | None:
         legal = _get_legal_cols(board, origin="top")
@@ -158,7 +228,7 @@ class AnthropicProvider:
         raw = self._call(_build_move_prompt(board, current_player, origin="top"))
         text = _strip_thinking(raw).strip()
         if self.cfg.debug:
-            print(f"  [LLM move] answer={repr(text[:60])}")
+            print(f"  [LLM raw move] {repr(raw[:200])}")
         try:
             col = int(re.search(r"\d+", text).group())
             return col if col in legal else None
@@ -186,10 +256,9 @@ class DeepSeekProvider:
 
     def evaluate_position(self, board, current_player: int) -> float:
         raw = self._call(_build_prompt(board, current_player, origin="top"))
-        val = _parse_float(raw)
         if self.cfg.debug:
-            print(f"  [LLM eval] answer={repr(_strip_thinking(raw).strip()[:60])}  parsed={val:.2f}")
-        return val
+            print(f"  [LLM raw] {repr(raw[:200])}")
+        return _parse_float(raw, debug=self.cfg.debug)
 
     def suggest_move(self, board, current_player: int) -> int | None:
         legal = _get_legal_cols(board, origin="top")
@@ -198,7 +267,7 @@ class DeepSeekProvider:
         raw = self._call(_build_move_prompt(board, current_player, origin="top"))
         text = _strip_thinking(raw).strip()
         if self.cfg.debug:
-            print(f"  [LLM move] answer={repr(text[:60])}")
+            print(f"  [LLM raw move] {repr(raw[:200])}")
         try:
             col = int(re.search(r"\d+", text).group())
             return col if col in legal else None
@@ -206,40 +275,9 @@ class DeepSeekProvider:
             return None
 
 
-class OllamaProvider:
-    def __init__(self, cfg: LLMConfig):
-        self.cfg = cfg
-        self.base_url = (cfg.base_url or "http://localhost:11434").rstrip("/")
-
-    def _call(self, prompt: str) -> str:
-        url = f"{self.base_url}/api/generate"
-        headers = {"Content-Type": "application/json"}
-        body = {"model": self.cfg.model, "prompt": prompt, "stream": False,
-                "options": {"temperature": self.cfg.temperature,
-                            "num_predict": self.cfg.max_tokens}}
-        return _http_post(url, headers, body, self.cfg.timeout).get("response", "")
-
-    def evaluate_position(self, board, current_player: int) -> float:
-        raw = self._call(_build_prompt(board, current_player, origin="top"))
-        val = _parse_float(raw)
-        if self.cfg.debug:
-            print(f"  [LLM eval] answer={repr(_strip_thinking(raw).strip()[:60])}  parsed={val:.2f}")
-        return val
-
-    def suggest_move(self, board, current_player: int) -> int | None:
-        legal = _get_legal_cols(board, origin="top")
-        if not legal:
-            return None
-        raw = self._call(_build_move_prompt(board, current_player, origin="top"))
-        text = _strip_thinking(raw).strip()
-        if self.cfg.debug:
-            print(f"  [LLM move] answer={repr(text[:60])}")
-        try:
-            col = int(re.search(r"\d+", text).group())
-            return col if col in legal else None
-        except Exception:
-            return None
-
+# ---------------------------------------------------------------------------
+# Cache wrapper
+# ---------------------------------------------------------------------------
 
 class CachedProvider:
     def __init__(self, inner, cfg: LLMConfig):
