@@ -28,6 +28,7 @@ import copy
 import math
 import random
 import time
+import threading
 from typing import Optional
 
 from llm_mcts import LLMEvaluator, MoveRecord
@@ -263,7 +264,12 @@ class MCTSAgent:
             )
 
     def get_move(self, board: list[list[int]]) -> int:
-        """Run MCTS and return the best column to play."""
+        """Run MCTS and return the best column to play.
+
+        Simulations run in parallel threads (default 4) since each LLM call
+        is an independent HTTP request — this cuts wall-clock time by ~4x.
+        The tree Selection/Expansion/Backprop steps are protected by a lock.
+        """
         self._ensure_provider()
         root = LLMMCTSNode(
             board=board,
@@ -276,29 +282,45 @@ class MCTSAgent:
             use_prior=self.use_prior,
         )
 
+        tree_lock = threading.Lock()
+        iterations_done = [0]
         deadline = time.time() + self.time_limit if self.time_limit > 0 else None
-        i = 0
-        while True:
-            if deadline and time.time() >= deadline:
-                break
-            if not deadline and i >= self.iterations:
-                break
-            i += 1
 
-            # Selection
-            node = root
-            while node.is_fully_expanded() and not node.is_terminal():
-                node = node.best_child()
+        def run_simulation():
+            while True:
+                # Check budget
+                with tree_lock:
+                    if deadline and time.time() >= deadline:
+                        return
+                    if not deadline and iterations_done[0] >= self.iterations:
+                        return
+                    iterations_done[0] += 1
 
-            # Expansion
-            if not node.is_terminal():
-                node = node.expand()
+                    # Selection (needs lock — reads/writes tree structure)
+                    node = root
+                    while node.is_fully_expanded() and not node.is_terminal():
+                        node = node.best_child()
 
-            # Simulation
-            result = node.simulate()
+                    # Expansion (needs lock)
+                    if not node.is_terminal():
+                        node = node.expand()
 
-            # Backpropagation
-            node.backpropagate(result)
+                # Simulation — runs OUTSIDE lock so threads run LLM calls in parallel
+                result = node.simulate()
+
+                # Backpropagation (needs lock)
+                with tree_lock:
+                    node.backpropagate(result)
+
+        # Spawn parallel simulation threads
+        # Use 4 workers — matches typical Ollama parallel request handling
+        n_workers = min(4, self.iterations)
+        threads = [threading.Thread(target=run_simulation, daemon=True)
+                   for _ in range(n_workers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
         # Return most-visited child
         if root.children:
@@ -387,12 +409,15 @@ def run_benchmark(
             latency = time.time() - t0
             move_num += 1
 
-            # Evaluate position for reporting
-            agent._ensure_provider()
-            try:
-                win_prob = agent.provider.evaluate_position(board, current)
-            except Exception:
-                win_prob = None
+            # Reuse the last win_prob already recorded inside the evaluator
+            # during get_move() — avoids a redundant extra LLM call per move
+            win_prob = None
+            if hasattr(agent, 'evaluator') and agent.evaluator is not None:
+                records = agent.evaluator.move_records
+                if records:
+                    last = records[-1]
+                    if last.llm_win_prob is not None:
+                        win_prob = last.llm_win_prob
 
             rec = MoveRecord(
                 move_number=move_num,
